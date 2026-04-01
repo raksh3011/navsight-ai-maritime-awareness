@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<!--
+  Frontend canvas rendering performance test.
+  Open this file directly in browser (no server needed).
+  Tests how fast drawCanvas() renders N vessels at different zoom levels.
+-->
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>ORVMS Frontend Perf Test</title>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <style>
+    body { font-family: monospace; background: #0a1929; color: #e8f4f8; padding: 20px; }
+    #map { width: 800px; height: 400px; margin: 16px 0; }
+    table { border-collapse: collapse; width: 100%; }
+    th, td { border: 1px solid #1e3a5f; padding: 8px 14px; text-align: right; }
+    th { background: #0d2137; color: #00b4d8; text-align: left; }
+    .pass { color: #06d6a0; } .warn { color: #ffd60a; } .fail { color: #ef476f; }
+    button { background: #00b4d8; color: #fff; border: none; padding: 10px 24px;
+             border-radius: 8px; cursor: pointer; font-size: 14px; margin: 8px 4px; }
+  </style>
+</head>
+<body>
+  <h2>ORVMS — Frontend Canvas Rendering Benchmark</h2>
+  <div id="map"></div>
+  <button onclick="runBench()">Run Benchmark</button>
+  <button onclick="runStress()">Stress Test (5000 vessels)</button>
+  <div id="results" style="margin-top:16px"></div>
+
+<script>
+const map = L.map('map', { zoomControl:true }).setView([15,78], 3);
+L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+  { maxZoom:18, noWrap:true }).addTo(map);
+
+// Minimal canvas overlay
+const mapEl = document.getElementById('map');
+const canvas = document.createElement('canvas');
+canvas.style.cssText = 'position:absolute;top:0;left:0;pointer-events:none;z-index:500;';
+mapEl.style.position = 'relative';
+mapEl.appendChild(canvas);
+
+function resize() { canvas.width = mapEl.offsetWidth; canvas.height = mapEl.offsetHeight; }
+resize();
+new ResizeObserver(resize).observe(mapEl);
+
+// Generate random vessels
+function makeVessels(n) {
+  const types = ['Naval Vessel','Cargo Ship','Tanker','Fishing Vessel','Unknown','Passenger Ship'];
+  const flags = ['India','China','USA','Pakistan','Unknown','UK'];
+  return Array.from({length: n}, (_, i) => ({
+    mmsi: String(i), name: `Vessel ${i}`,
+    lat: 5 + Math.random() * 20, lon: 60 + Math.random() * 40,
+    speed: Math.random() * 35, heading: Math.random() * 360,
+    vessel_type: types[i % types.length], flag: flags[i % flags.length],
+  }));
+}
+
+const COLORS = {
+  'Naval Vessel':'#4895ef','Cargo Ship':'#06d6a0','Tanker':'#ffd60a',
+  'Fishing Vessel':'#adb5bd','Unknown':'#90caf9','Passenger Ship':'#ff9f1c',
+};
+function getColor(v) { return COLORS[v.vessel_type] || '#90caf9'; }
+
+function drawVessels(vessels, zoom) {
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  for (const v of vessels) {
+    try {
+      const p = map.latLngToContainerPoint([v.lat, v.lon]);
+      if (p.x < -20 || p.y < -20 || p.x > canvas.width+20 || p.y > canvas.height+20) continue;
+      ctx.save();
+      ctx.translate(p.x, p.y);
+      ctx.rotate(v.heading * Math.PI / 180);
+      ctx.beginPath();
+      if (zoom >= 9) {
+        const h = 14, w = 7;
+        ctx.moveTo(0,-h); ctx.lineTo(w,h*.5); ctx.lineTo(0,h*.2); ctx.lineTo(-w,h*.5);
+      } else {
+        ctx.moveTo(0,-7); ctx.lineTo(4,5); ctx.lineTo(-4,5);
+      }
+      ctx.closePath();
+      ctx.fillStyle = getColor(v);
+      ctx.globalAlpha = 0.95;
+      ctx.fill();
+      ctx.restore();
+      ctx.globalAlpha = 1;
+    } catch {}
+  }
+}
+
+function bench(vessels, zoom, iterations) {
+  map.setZoom(zoom);
+  const times = [];
+  for (let i = 0; i < iterations; i++) {
+    const t0 = performance.now();
+    drawVessels(vessels, zoom);
+    times.push(performance.now() - t0);
+  }
+  times.sort((a,b) => a-b);
+  return {
+    min: times[0].toFixed(2),
+    avg: (times.reduce((a,b)=>a+b,0)/times.length).toFixed(2),
+    p95: times[Math.floor(times.length*0.95)].toFixed(2),
+    max: times[times.length-1].toFixed(2),
+    fps: (1000 / (times.reduce((a,b)=>a+b,0)/times.length)).toFixed(0),
+  };
+}
+
+function ratingClass(fps) {
+  return fps >= 30 ? 'pass' : fps >= 15 ? 'warn' : 'fail';
+}
+
+function runBench() {
+  const scenarios = [100, 500, 1000, 2000, 5000];
+  let html = `<table><tr><th>Vessels</th><th>Zoom</th><th>Min (ms)</th>
+    <th>Avg (ms)</th><th>P95 (ms)</th><th>Max (ms)</th><th>Est. FPS</th></tr>`;
+  for (const n of scenarios) {
+    const v = makeVessels(n);
+    for (const z of [3, 7]) {
+      const r = bench(v, z, 50);
+      const cls = ratingClass(parseFloat(r.fps));
+      html += `<tr><td>${n}</td><td>${z}</td><td>${r.min}</td>
+        <td>${r.avg}</td><td>${r.p95}</td><td>${r.max}</td>
+        <td class="${cls}">${r.fps}</td></tr>`;
+    }
+  }
+  html += '</table><p style="color:#adb5bd;font-size:12px">✅ ≥30 FPS  ⚠️ 15-29 FPS  ❌ &lt;15 FPS</p>';
+  document.getElementById('results').innerHTML = html;
+}
+
+function runStress() {
+  const v = makeVessels(5000);
+  const r = bench(v, 3, 100);
+  document.getElementById('results').innerHTML =
+    `<p>5000 vessels @ zoom 3 — Avg: <b>${r.avg}ms</b> | FPS: <b class="${ratingClass(parseFloat(r.fps))}">${r.fps}</b></p>`;
+}
+</script>
+</body>
+</html>

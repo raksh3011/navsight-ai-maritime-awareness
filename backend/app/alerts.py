@@ -1,87 +1,33 @@
 """
-Alert engine — Indian Maritime Domain Awareness.
-
-Three rules:
-  1. High speed (>=25 kn) OUTSIDE Indian maritime boundary  → low
-  2. Unfriendly vessel inside/entering Indian boundary       → high
-  3. Unfriendly vessel inside/entering at high speed         → critical
-
-Uses ray-casting point-in-polygon against the actual EEZ boundary,
-not a simple bounding box.
+OceanGuard AI — Climate-Aware Alert Engine
+==========================================
+Three alert rules with explainable AI reasoning and climate context:
+  1. High speed outside Indian boundary  → low
+  2. Unfriendly vessel entering boundary → high
+  3. Unfriendly vessel at high speed     → critical
+  4. Any vessel entering piracy zone     → high (with weather context)
+  5. Climate risk score threshold breach → medium/high/critical
 """
-import uuid, logging
+import uuid
+import logging
 from datetime import datetime, timezone
 from typing import Optional
-from app.models import Vessel, Alert
+
+from app.models import Vessel, Alert, WeatherSnapshot
+from app.risk_engine import (
+    compute_risk_score, predict_anomaly,
+    FRIENDLY_FLAGS, PIRACY_ZONES, _in_india_eez, _in_zone
+)
+from app.weather import get_cached_weather
 
 logger = logging.getLogger(__name__)
 
 _alerts: list[Alert] = []
-_MAX_ALERTS = 200
+_MAX_ALERTS = 1000
 _prev_states: dict[str, Vessel] = {}
 _cooldowns: dict[str, datetime] = {}
-COOLDOWN_SECS = 300  # 5 minutes
-
+COOLDOWN_SECS = 300
 HIGH_SPEED_KN = 25.0
-
-FRIENDLY_FLAGS = {
-    "India", "USA", "UK", "France", "Australia", "Japan", "South Korea",
-    "New Zealand", "Canada", "Germany", "Italy", "Norway", "Netherlands",
-    "Denmark", "Sweden", "Finland", "Portugal", "Spain", "Greece",
-}
-
-# India 200-NM EEZ — main polygon (Arabian Sea + Bay of Bengal)
-INDIA_BOUNDARY_MAIN = [
-    (23.5, 62.0), (23.5, 68.0), (23.5, 72.0), (23.0, 80.0), (22.5, 87.0), (22.0, 89.5),
-    (21.5, 89.5),
-    (20.0, 89.0), (18.0, 88.5), (16.0, 88.0), (14.0, 87.5), (12.5, 87.0),
-    (11.0, 86.5), (10.0, 85.5), (9.0, 84.0),
-    (8.0, 82.5), (7.0, 81.0), (6.0, 80.0),
-    (5.0, 78.5), (3.5, 77.0), (2.5, 75.5), (2.0, 74.0),
-    (2.5, 72.5), (3.5, 71.0),
-    (5.0, 69.5), (6.5, 68.0), (7.5, 67.5),
-    (9.0, 67.0), (11.0, 66.5), (13.0, 66.0), (15.0, 65.5),
-    (17.0, 65.0), (19.0, 64.0), (21.0, 63.0), (22.5, 62.5),
-    (23.5, 62.0),
-]
-
-# Andaman & Nicobar Islands EEZ
-INDIA_BOUNDARY_ANDAMAN = [
-    (14.0, 91.5), (14.0, 96.5),
-    (13.0, 97.0), (12.0, 97.0), (11.0, 96.5),
-    (10.0, 96.0), (9.0, 95.5),  (8.0, 95.0),
-    (7.0, 94.5),  (6.5, 93.5),  (6.0, 92.5),
-    (6.5, 91.5),  (7.5, 91.0),  (9.0, 91.0),
-    (11.0, 91.0), (13.0, 91.0),
-    (14.0, 91.5),
-]
-
-
-def _point_in_poly(lat: float, lon: float, poly: list) -> bool:
-    """Ray-casting point-in-polygon. poly is list of (lat, lon) tuples."""
-    inside = False
-    n = len(poly)
-    j = n - 1
-    for i in range(n):
-        xi, yi = poly[i]
-        xj, yj = poly[j]
-        if ((yi > lon) != (yj > lon)) and \
-           (lat < (xj - xi) * (lon - yi) / (yj - yi) + xi):
-            inside = not inside
-        j = i
-    return inside
-
-
-def _in_eez(v: Vessel) -> bool:
-    return (_point_in_poly(v.lat, v.lon, INDIA_BOUNDARY_MAIN) or
-            _point_in_poly(v.lat, v.lon, INDIA_BOUNDARY_ANDAMAN))
-
-
-def _is_unfriendly(v: Vessel) -> bool:
-    flag = (v.flag or "").strip()
-    if not flag or flag == "Unknown":
-        return False
-    return flag not in FRIENDLY_FLAGS
 
 
 def _cooldown_ok(mmsi: str, rule: str) -> bool:
@@ -102,74 +48,122 @@ def _add_alert(alert: Alert):
     _alerts.insert(0, alert)
     if len(_alerts) > _MAX_ALERTS:
         _alerts.pop()
-    logger.info("ALERT [%s] %s — %s", alert.priority.upper(), alert.alert_type, alert.message)
+    logger.info("ALERT [%s] %.0f%% risk — %s", alert.priority.upper(),
+                alert.risk_score, alert.message)
+    # Async DB write (non-blocking)
+    try:
+        import asyncio
+        from app.pg_store import save_alert_async
+        asyncio.create_task(save_alert_async(alert))
+    except Exception:
+        pass
 
 
-def rule_high_speed_outside(vessel: Vessel, prev: Optional[Vessel]):
-    """High speed vessel outside Indian maritime boundary → low."""
-    if _in_eez(vessel):
+def _make_alert(vessel: Vessel, alert_type: str, message: str,
+                priority: str, weather: Optional[WeatherSnapshot] = None) -> Alert:
+    anomaly = predict_anomaly(vessel, weather)
+    risk_score, _, reasoning, confidence = compute_risk_score(vessel, weather, anomaly)
+    return Alert(
+        id=str(uuid.uuid4()),
+        vessel_mmsi=vessel.mmsi,
+        vessel_name=vessel.name,
+        alert_type=alert_type,
+        message=message,
+        priority=priority,
+        risk_score=risk_score,
+        confidence=confidence,
+        reasoning=reasoning,
+        lat=vessel.lat,
+        lon=vessel.lon,
+        weather_context=weather,
+        timestamp=datetime.now(timezone.utc),
+    )
+
+
+def rule_high_speed_outside(vessel: Vessel, prev: Optional[Vessel],
+                             weather: Optional[WeatherSnapshot]):
+    if _in_india_eez(vessel.lat, vessel.lon):
         return
     if vessel.speed < HIGH_SPEED_KN:
         return
     if not _cooldown_ok(vessel.mmsi, "highspeed_outside"):
         return
-    _add_alert(Alert(
-        id=str(uuid.uuid4()),
-        vessel_mmsi=vessel.mmsi,
-        vessel_name=vessel.name,
-        alert_type="high_speed_outside",
-        message=f"{vessel.name or vessel.mmsi} at {vessel.speed:.1f} kn outside Indian maritime boundary",
-        priority="low",
-        lat=vessel.lat, lon=vessel.lon,
-        timestamp=datetime.now(timezone.utc),
-    ))
+    msg = f"{vessel.name or vessel.mmsi} at {vessel.speed:.1f} kn outside Indian boundary"
+    if weather and weather.storm_index > 0.4:
+        msg += f" — storm conditions (wave {weather.wave_height:.1f}m)"
+    _add_alert(_make_alert(vessel, "high_speed_outside", msg, "low", weather))
 
 
-def rule_unfriendly_entry(vessel: Vessel, prev: Optional[Vessel]):
-    """Unfriendly vessel inside/entering Indian boundary — high or critical."""
-    in_now = _in_eez(vessel)
+def rule_unfriendly_entry(vessel: Vessel, prev: Optional[Vessel],
+                           weather: Optional[WeatherSnapshot]):
+    in_now = _in_india_eez(vessel.lat, vessel.lon)
     if not in_now:
         return
-    # Fire on entry (was outside) OR first sighting inside (no prev)
-    was_inside = _in_eez(prev) if prev else False
+    was_inside = _in_india_eez(prev.lat, prev.lon) if prev else False
     if was_inside:
         return
-    if not _is_unfriendly(vessel):
+    flag = (vessel.flag or "").strip()
+    if not flag or flag == "Unknown" or flag in FRIENDLY_FLAGS:
         return
     if not _cooldown_ok(vessel.mmsi, "unfriendly_entry"):
         return
 
     if vessel.speed >= HIGH_SPEED_KN:
         priority = "critical"
-        alert_type = "unfriendly_entry_highspeed"
         msg = (f"{vessel.name or vessel.mmsi} ({vessel.flag}) entering Indian boundary"
                f" at {vessel.speed:.1f} kn")
     else:
         priority = "high"
-        alert_type = "unfriendly_entry"
         msg = f"{vessel.name or vessel.mmsi} ({vessel.flag}) entering Indian maritime boundary"
 
-    _add_alert(Alert(
-        id=str(uuid.uuid4()),
-        vessel_mmsi=vessel.mmsi,
-        vessel_name=vessel.name,
-        alert_type=alert_type,
-        message=msg,
-        priority=priority,
-        lat=vessel.lat, lon=vessel.lon,
-        timestamp=datetime.now(timezone.utc),
-    ))
+    if weather and weather.storm_index > 0.3:
+        msg += f" — adverse weather may mask approach (storm index {weather.storm_index:.2f})"
+
+    _add_alert(_make_alert(vessel, f"unfriendly_entry{'_highspeed' if vessel.speed >= HIGH_SPEED_KN else ''}",
+                           msg, priority, weather))
 
 
-RULES = [rule_high_speed_outside, rule_unfriendly_entry]
+def rule_piracy_zone(vessel: Vessel, prev: Optional[Vessel],
+                     weather: Optional[WeatherSnapshot]):
+    """Alert when any vessel enters a piracy zone — with climate context."""
+    for z in PIRACY_ZONES:
+        in_now = _in_zone(vessel.lat, vessel.lon, z)
+        was_in = _in_zone(prev.lat, prev.lon, z) if prev else False
+        if in_now and not was_in and _cooldown_ok(vessel.mmsi, f"piracy_{z['name']}"):
+            msg = f"{vessel.name or vessel.mmsi} entered {z['name']}"
+            # Climate context — calm seas = higher piracy risk (skiff operations)
+            if weather:
+                if weather.wave_height < 1.5 and weather.wind_speed < 8:
+                    msg += " — calm seas increase piracy skiff risk"
+                elif weather.storm_index > 0.5:
+                    msg += f" — storm forcing route through high-risk corridor"
+            _add_alert(_make_alert(vessel, "piracy_zone_entry", msg, "high", weather))
+
+
+def rule_climate_risk_threshold(vessel: Vessel, prev: Optional[Vessel],
+                                 weather: Optional[WeatherSnapshot]):
+    """Alert when composite climate risk score crosses a threshold."""
+    if vessel.risk_score < 60:
+        return
+    if not _cooldown_ok(vessel.mmsi, "climate_risk"):
+        return
+    priority = "critical" if vessel.risk_score >= 80 else "high"
+    msg = (f"{vessel.name or vessel.mmsi} — {vessel.risk_score:.0f}% Climate Risk Score. "
+           f"{vessel.risk_label.upper()} threat level.")
+    _add_alert(_make_alert(vessel, "climate_risk_threshold", msg, priority, weather))
+
+
+RULES = [rule_high_speed_outside, rule_unfriendly_entry,
+         rule_piracy_zone, rule_climate_risk_threshold]
 
 
 class AlertEngine:
     def evaluate(self, vessel: Vessel):
         prev = _prev_states.get(vessel.mmsi)
+        weather = get_cached_weather(vessel.lat, vessel.lon)
         for rule in RULES:
             try:
-                rule(vessel, prev)
+                rule(vessel, prev, weather)
             except Exception as exc:
                 logger.debug("Rule %s error: %s", rule.__name__, exc)
         _prev_states[vessel.mmsi] = vessel

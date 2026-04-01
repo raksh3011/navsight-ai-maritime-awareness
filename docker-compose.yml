@@ -1,0 +1,45 @@
+version: "3.9"
+
+services:
+  # PostgreSQL 16 + PostGIS + pgvector
+  db:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_DB: oceanguard
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./backend/migrations/001_init_schema.sql:/docker-entrypoint-initdb.d/001_init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # OceanGuard AI Backend
+  app:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@db:5432/oceanguard
+      AIS_PROVIDER: demo
+      AIS_API_KEY: ""
+      POLL_INTERVAL: "3"
+      MAX_VESSELS: "20000"
+      CORS_ORIGINS: "http://localhost:3000,http://127.0.0.1:5500,http://localhost:5500,null"
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - ./backend:/app
+      - ./frontend:/app/../frontend
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+
+volumes:
+  pgdata:
